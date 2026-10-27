@@ -1024,6 +1024,8 @@ class NixlBaseConnectorWorker:
         # Region layer membership is populated for HMA and packed layouts.
         self.region_members = []
         self._packed_member_layouts: dict[str, tuple[int, int]] = {}
+        # Unsplit [NB, PS] caches registered as [NB*r, PS/r] kernel blocks.
+        self._has_chunked_manager_pages = False
         # Local layer order, set by ``_set_region_layers`` only when
         # routing by layer name. Empty means region-index routing.
         self._transfer_layer_names = tuple[str, ...]()
@@ -1545,6 +1547,7 @@ class NixlBaseConnectorWorker:
         self._scratch_region_indices = []
         self._ple_block_len = None
         self._ple_region_index = None
+        self._has_chunked_manager_pages = False
 
         # A shared packed row may transfer whole only if every page in it is
         # replicated across TP ranks: MLA without SSM state. Head-sharded
@@ -1663,6 +1666,17 @@ class NixlBaseConnectorWorker:
                     block_stride = physical_page_size
                 else:
                     block_stride = cache.stride(0) * cache.element_size()
+                    ratio = self._physical_blocks_per_logical_kv_block
+                    if (
+                        ratio > 1
+                        and cache.shape[0] * ratio == num_blocks
+                        and block_stride == layer_spec.page_size_bytes
+                    ):
+                        # A group whose block size equals the kernel block size
+                        # keeps [NB, PS] pages while the ratio comes from a larger
+                        # group. Its dense pages split into [NB*r, PS/r] blocks.
+                        block_stride = physical_page_size
+                        self._has_chunked_manager_pages = True
                 # A connector that registers the backing as one memory region
                 # may need its length rounded up to a page boundary. Such a tail
                 # is shorter than one block, so it cannot make the storage
@@ -2727,6 +2741,20 @@ class NixlBaseConnectorWorker:
         if not self.use_mla and not self._has_mamba:
             assert not (
                 tp_ratio < 0 and self.transfer_topo.is_kv_replicated(remote_engine_id)
+            )
+        # A chunk of an unsplit page is neither a head slice nor a token range.
+        if (
+            self._has_chunked_manager_pages
+            and not self.use_mla
+            and (tp_ratio != 1 or block_size_ratio != 1)
+        ):
+            raise NotImplementedError(
+                "KV cache groups with mixed block sizes require matching "
+                "TP and block sizes on both sides: "
+                f"local TP={self.transfer_topo.tp_size}, "
+                f"remote TP={remote_tp_size}, "
+                f"local block_size={self.block_size}, "
+                f"remote block_size={nixl_agent_meta.block_size}."
             )
         has_draft_regions = bool(self._head_sharded_draft_regions)
         draft_local_heads = draft_remote_heads = 1

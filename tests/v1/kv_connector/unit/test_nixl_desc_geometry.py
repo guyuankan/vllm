@@ -33,11 +33,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     create_kv_cache_views,
 )
 
@@ -573,6 +575,93 @@ def test_registration_ignores_a_sub_block_padding_tail(page_covers_view):
     )
 
     assert _descriptor_geometry(padded) == _descriptor_geometry(unpadded)
+
+
+@pytest.mark.cpu_test
+def test_mixed_group_block_sizes_transfer_whole_pages():
+    """A group at the kernel block size keeps [NB, PS] pages while a larger
+    group sets the kernel ratio, as Gemma 4 sliding and full attention do.
+    Each block of the smaller group must still transfer exactly its own page."""
+    kernel_block_size, num_logical_blocks = 2, 4
+    sliding_spec = SlidingWindowSpec(
+        block_size=kernel_block_size,
+        num_kv_heads=2,
+        head_size=4,
+        dtype=torch.uint8,
+        sliding_window=8,
+    )
+    full_spec = FullAttentionSpec(
+        block_size=2 * kernel_block_size,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.uint8,
+    )
+    page = sliding_spec.page_size_bytes
+    assert full_spec.page_size_bytes == page
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_logical_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_logical_blocks * page,
+                layers=["layers.0.attn", "layers.1.attn"],
+                layer_stride=num_logical_blocks * page,
+                block_stride=page,
+            )
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layers.0.attn"], sliding_spec),
+            KVCacheGroupSpec(["layers.1.attn"], full_spec),
+        ],
+    )
+    vllm_config = create_vllm_config(block_size=kernel_block_size)
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+
+    fake_backend = MagicMock()
+    fake_backend.get_supported_kernel_block_sizes.return_value = [kernel_block_size]
+    fake_backend.get_name.return_value = "FLASH_ATTN"
+    fake_backend.full_cls_name.return_value = "fake.FLASH_ATTN"
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = "VRAM"
+
+    from vllm.config import set_current_vllm_config
+
+    backing = torch.zeros(num_logical_blocks * page, dtype=torch.uint8)
+    sliding_view = backing.view(num_logical_blocks, 2, kernel_block_size, 8)
+    full_view = backing.view(2 * num_logical_blocks, 1, kernel_block_size, 8)
+    with (
+        patch.object(bw, "NixlWrapper", _RecordingNixl),
+        patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(bw, "get_current_attn_backends", return_value=[fake_backend]),
+        patch.object(bw, "current_platform", fake_platform),
+        set_current_vllm_config(vllm_config),
+    ):
+        worker = NixlPullConnectorWorker(vllm_config, "local-engine", kv_cache_config)
+        worker.register_kv_caches(
+            {"layers.0.attn": sliding_view, "layers.1.attn": full_view}
+        )
+
+    assert worker._physical_blocks_per_logical_kv_block == 2
+    assert worker.block_len_per_layer == [page // 2]
+    assert worker.block_stride_per_layer == [page // 2]
+    assert worker.region_num_blocks == [2 * num_logical_blocks]
+
+    local_descs = expand_strided_descs(worker.src_blocks_data)
+    for block in range(num_logical_blocks):
+        kernel_ids = worker._logical_to_kernel_block_ids(
+            ([block], []), worker._physical_blocks_per_logical_kv_block
+        )
+        desc_ids = worker._compute_desc_ids(
+            kernel_ids,
+            worker.num_blocks,
+            None,
+            worker._physical_blocks_per_logical_kv_block,
+        )
+        covered = [(int(addr), int(size)) for addr, size, _ in local_descs[desc_ids]]
+        page_start = sliding_view[block].data_ptr()
+        assert covered == [(page_start, page // 2), (page_start + page // 2, page // 2)]
 
 
 def _make_mla_hybrid_worker(
